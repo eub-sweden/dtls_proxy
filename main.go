@@ -167,7 +167,12 @@ func main() {
 			continue
 		}
 
-		// Chect if there's an existing connection that has gone stale
+		// DTLS sessions with ConnectionId can potentially last for days without
+		// any activity. For this reason we can't rely on the stack or the OS to
+		// garbage collect stale connections. The only indicator we have that a
+		// connection has gone stale is the client reconnecting with the same
+		// PskId. When this occurs, we close the old connection to prevent
+		// memory leaks.
 		pskId := pskIdFromConn(conn)
 		staleConn := connMap[pskId]
 		if staleConn != nil {
