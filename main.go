@@ -13,6 +13,9 @@ import (
 	"flag"
 	"log"
 	"os"
+	"net/http"
+	"strings"
+	"io"
 
 	"github.com/pion/dtls/v2"
 	"github.com/pion/dtls/v2/examples/util"
@@ -65,7 +68,7 @@ func pipe(conn1 net.Conn, conn2 net.Conn) {
     }
 }
 
-func pskLookup(pskId []byte, kms map[string][]byte) []byte {
+func pskMapLookup(pskId []byte, kms map[string][]byte) []byte {
 	psk := kms[string(pskId)]
 	if psk == nil {
 		fmt.Printf("Client \"%s\" not found!\n", pskId)
@@ -75,6 +78,42 @@ func pskLookup(pskId []byte, kms map[string][]byte) []byte {
 
 	return psk
 }
+
+func pskRestLookup(pskId []byte, url string, extraQ string) []byte {
+	client := &http.Client{}
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		log.Print(err)
+		return nil
+	}
+
+	q := req.URL.Query()
+	q.Add("pskId", string(pskId))
+	if len(extraQ) > 0 {
+		splitExtraQ := strings.Split(extraQ, "=")
+		q.Add(splitExtraQ[0], splitExtraQ[1])
+	}
+
+	req.URL.RawQuery = q.Encode()
+
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Print(err)
+		return nil
+	}
+
+	resBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Print(err)
+		return nil
+	}
+
+	fmt.Println("http response: ", resBody)
+
+	return resBody
+}
+
 
 func mapFromCsv(path string) map[string][]byte {
 	f, err := os.Open(path)
@@ -104,8 +143,6 @@ func mapFromCsv(path string) map[string][]byte {
 	return m
 }
 
-
-
 func pskIdFromConn(conn net.Conn) string {
 	var dtlsConn *dtls.Conn = conn.(*dtls.Conn)
 	hint := string(dtlsConn.ConnectionState().IdentityHint)
@@ -116,19 +153,17 @@ func pskIdFromConn(conn net.Conn) string {
 func main() {
 	bindPtr := flag.String("bind", "0.0.0.0:14881", "local ip:port to bind");
 	upsPtr := flag.String("connect", "kontor.eub.se:14999", "upstream plaintext ip:port")
-	csvPtr := flag.String("psk-csv", "keys.csv", "id/psk csv file")
+	csvPtr := flag.String("psk-csv", "", "id/psk csv file")
+	restPtr := flag.String("psk-rest", "", "id/psk rest looup uri")
 
 	flag.Parse()
 
 	fmt.Println("bind:", *bindPtr);
 	fmt.Println("ups:", *upsPtr);
-	fmt.Println("csv:", *csvPtr);
 
 	// Map between conns and PSK IDs, used to terminate stale connections
 	var connMap map[string]net.Conn
 	connMap = make(map[string]net.Conn)
-
-	kms := mapFromCsv(*csvPtr)
 
 	upstreamAddr := *upsPtr;
 
@@ -146,11 +181,43 @@ func main() {
 			return context.WithTimeout(ctx, 30*time.Second)
 		},
         ConnectionIDGenerator: dtls.RandomCIDGenerator(8),
-		PSK: func(hint []byte) ([]byte, error) {
-			return pskLookup(hint, kms), nil
-		},
 		CipherSuites: []dtls.CipherSuiteID{dtls.TLS_PSK_WITH_AES_128_CCM_8},
 	}
+
+	// If KMS lookup is via local csv, create a map from it
+	if len(*csvPtr) > 0 {
+		fmt.Println("csv:", *csvPtr);
+		kmsMap := mapFromCsv(*csvPtr);
+		config.PSK = func(hint []byte) ([]byte, error) {
+			return pskMapLookup(hint, kmsMap), nil
+		};
+	} else if len(*restPtr) > 0 {
+		fmt.Println("Targeting kms url:", *restPtr);
+
+		// Split into base and query param
+		var base string;
+		var xtra string;
+		split := strings.Split(*restPtr, "?")
+		if len(split) == 2 {
+			base = split[0];
+			xtra = split[1]
+			fmt.Println("url: ", base, " and ", xtra);
+		} else {
+			base = *restPtr;
+			xtra = "";
+		}
+
+		config.PSK = func(hint []byte) ([]byte, error) {
+			return pskRestLookup(hint, base, xtra), nil
+		};
+
+	} else {
+		fmt.Println("No KMS lookup method provided!");
+		os.Exit(1)
+	}
+
+
+
 
 	listener, err := dtls.Listen("udp", addr, config)
 	util.Check(err)
