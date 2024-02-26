@@ -40,11 +40,27 @@ architecture! The barrier of entry has never been lower! Yay!
 
 ## Key management integration
 
-Iteration 1 of the proxy only supports the simplest KMS integration possible:
-feeding the id/key pairs via a CSV file. Adding additional integrations (Redis,
-SQL, etc) is just a matter of extending the `pskLookup()` function (patches more
-than welcome).
+Iteration 1 of the proxy only supported the simplest KMS integration possible:
+feeding the id/key pairs via a CSV file.
 
+Experimental REST support is also available:
+
+```
+./dtls_proxy ... --psk-rest http://$KMS_SRV:$KMS_PORT/keys
+```
+
+The KMS service needs to expect a query parameter of the form
+`pskId=SOME_STRING`. If it requires additional query parameters (such as API
+key), you can piggyback that onto the URL like this:
+
+```
+--psk-rest http://$KMS_SRV:$KMS_PORT/keys?apiKey=7ad2d94771c9f11f26a51223cb0d0608
+```
+
+or whatever -- the final request will include both the `pskId=SOME_STRING` part
+and the `apiKey=7ad2d94771c9f11f26a51223cb0d0608` part. The PSK should be
+returned in the body as raw binary data (no content-type checking or anything
+like that is done by the DTLS proxy).
 
 ## DTLS Connection ID
 
