@@ -40,10 +40,38 @@ architecture! The barrier of entry has never been lower! Yay!
 
 ## Key management integration
 
-Iteration 1 of the proxy only supports the simplest KMS integration possible:
+Iteration 1 of the proxy only supported the simplest KMS integration possible:
 feeding the id/key pairs via a CSV file. Adding additional integrations (Redis,
 SQL, etc) is just a matter of extending the `pskLookup()` function (patches more
 than welcome).
+
+I made an attempt at supporting REST-based KMS, which should work but should
+also be considered highly experimental - generalizing all the possible
+parameters of a REST call turned out to require too many degrees of freedom
+which made the REST KMS interface ugly and bloated.
+
+Instead, what I currently recommend is the "shell KMS" interface. If you use the
+argument `--psk-rest-cmd /path/to/my_command.sh`, the proxy will shell out to
+this command, with the PSK ID of the connected client as its first and only
+argument. It expects the shell command to return the PSK of the device in ASCII
+hex, i.e.
+
+```
+$ /path/to/my_command.sh clientId123
+275bc446abf921de084df7cdaf399082
+```
+
+So, if you want KMS via REST, your command may look something like
+
+```
+#!/bin/sh
+
+BEARER_TOKEN="NWQwOTkyOTkwZGU0ZTFlMTZhODIwMzY4NGRiMDE4NTUyMWYyYTVhOTVhNGE2NDIwYTU1NDYxYzUyODEwZTY1Zgo="
+
+curl -s -X GET https://my-kms.com/pskKeys?pskId=$1 \
+    -H "Authorization: Bearer $BEARER_TOKEN" \
+    | jq -j '.[0] | .psk'
+```
 
 
 ## DTLS Connection ID
