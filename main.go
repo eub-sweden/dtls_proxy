@@ -1,32 +1,31 @@
-// SPDX-FileCopyrightText: 2023 Elektronikutvecklingsbyrån EUB AB <https://www.eub.se/en>
+// SPDX-FileCopyrightText: 2025 Elektronikutvecklingsbyrån EUB AB <https://eub.se>
 // SPDX-License-Identifier: MIT
 
 package main
 
 import (
-	"context"
-	"encoding/csv"
-	"encoding/hex"
+	"flag"
 	"fmt"
 	"net"
-	"time"
-	"flag"
 	"log"
+	"sync"
 	"os"
-	"net/http"
-	"strings"
-	"io"
 	"os/exec"
+	"encoding/csv"
+	"encoding/hex"
+	"io"
+	"strings"
+	"context"
+	"time"
 
-	"github.com/pion/dtls/v2"
-	"github.com/pion/dtls/v2/examples/util"
+	"github.com/pion/dtls/v3"
 )
 
-func chanFromConn(conn net.Conn) chan []byte {
+func chanFromConn(conn net.Conn, id string) chan []byte {
     c := make(chan []byte)
 
     go func() {
-        b := make([]byte, 1024)
+        b := make([]byte, 2048)
 
         for {
             n, err := conn.Read(b)
@@ -36,6 +35,7 @@ func chanFromConn(conn net.Conn) chan []byte {
                 c <- res
             }
             if err != nil {
+				log.Printf("[%s] conn read error: %v", id, err)
                 c <- nil
                 break
             }
@@ -45,294 +45,221 @@ func chanFromConn(conn net.Conn) chan []byte {
     return c
 }
 
-func pipe(conn1 net.Conn, conn2 net.Conn) {
-    chan1 := chanFromConn(conn1)
-    chan2 := chanFromConn(conn2)
+// --- Simple pipe function ---
+func pipe(conn1 net.Conn, conn2 net.Conn, id string) {
+	defer conn1.Close() // <- make sure both get closed
+    defer conn2.Close()
+
+    chan1 := chanFromConn(conn1, id)
+    chan2 := chanFromConn(conn2, id)
 
     for {
         select {
         case b1 := <-chan1:
             if b1 == nil {
-				fmt.Println("Broken pipe?")
+				log.Printf("[%s] Broken pipe? (conn1)", id)
                 return
             } else {
-                conn2.Write(b1)
-            }
-        case b2 := <-chan2:
-            if b2 == nil {
-				fmt.Println("Broken pipe?")
-                return
-            } else {
-                conn1.Write(b2)
-            }
-        }
+				if _, err := conn2.Write(b1); err != nil {
+					log.Printf("write error conn2: %v", err)
+					return
+				}
+			}
+		case b2 := <-chan2:
+			if b2 == nil {
+				log.Printf("[%s] Broken pipe? (conn1)", id)
+				return
+			} else {
+				if _, err := conn1.Write(b2); err != nil {
+					log.Printf("[%s] write error conn1: %v", id, err)
+					return
+				}
+			}
+		}
+	}
+}
+
+// -- Session cleanup stuff --
+var (
+    mu       sync.Mutex
+    sessions = make(map[string]*dtls.Conn) // keyed by PSK identity
+)
+
+func registerSession(pskID string, c *dtls.Conn) {
+    mu.Lock()
+    defer mu.Unlock()
+
+    if old, ok := sessions[pskID]; ok {
+		log.Printf("[%s] closing old session, replacing with new one", pskID)
+        old.Close()          // tear down old one
+        delete(sessions, pskID)
+    }
+
+    sessions[pskID] = c
+    log.Printf("[%s] registered new session", pskID)
+}
+
+func unregisterSession(pskID string, c *dtls.Conn) {
+    mu.Lock()
+    defer mu.Unlock()
+
+    if current, ok := sessions[pskID]; ok && current == c {
+        current.Close()
+        delete(sessions, pskID)
+        log.Printf("[%s] session unregistered", pskID)
     }
 }
 
-func pskMapLookup(pskId []byte, kms map[string][]byte) []byte {
-	psk := kms[string(pskId)]
-	if psk == nil {
-		fmt.Printf("Client \"%s\" not found!\n", pskId)
-	} else {
-		fmt.Printf("Client \"%s\" found\n", pskId)
-	}
+// -- cmd line args --
+var (
+    bindAddr    = flag.String("bind", ":4444", "UDP listen address")
+    connectAddr = flag.String("connect", "127.0.0.1:9999", "Upstream UDP address")
+    pskCSV      = flag.String("psk-csv", "", "Path to CSV file with PSK identities and keys")
+    shellKMS    = flag.String("shell-kms-cmd", "", "Shell command to run for PSK lookup")
+	requireEMS  = flag.Bool("require-ems", false, "Only allow connections with Extended Master Secret (RFC 7627)")
+)
 
-	return psk
+var pskMap = map[string][]byte{}
+
+func loadPSKCSV(path string) error {
+    f, err := os.Open(path)
+    if err != nil {
+        return err
+    }
+    defer f.Close()
+
+    r := csv.NewReader(f)
+    for {
+        rec, err := r.Read()
+        if err == io.EOF {
+            break
+        }
+        if err != nil {
+            return err
+        }
+        if len(rec) < 2 {
+            continue
+        }
+        id, hexKey := rec[0], rec[1]
+        key, err := hex.DecodeString(hexKey)
+        if err != nil {
+            return fmt.Errorf("invalid hex for id %s: %w", id, err)
+        }
+        pskMap[id] = key
+    }
+    return nil
 }
 
-var extraRestHeaders = make(map[string]string)
-var idQueryKey string
-var idQueryVal string
-
-func pskRestLookup(pskId []byte, url string, extraQ string) []byte {
-	client := &http.Client{}
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		log.Print(err)
-		return nil
-	}
-
-	q := req.URL.Query()
-
-	// FIXME: We should construct a single global request with everything except
-	// the query populated, since that's the only thing that changes between
-	// requests
-	q.Add(idQueryKey, idQueryVal + string(pskId))
-	if len(extraQ) > 0 {
-		splitExtraQ := strings.Split(extraQ, "=")
-		q.Add(splitExtraQ[0], splitExtraQ[1])
-	}
-
-	req.URL.RawQuery = q.Encode()
-
-	// Iterate over all extra headers
-	for k, v := range extraRestHeaders {
-		req.Header.Add(k, v)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Print(err)
-		return nil
-	}
-
-	resBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Print(err)
-		return nil
-	}
-
-	// FIXME: now convert from ascii hex to bytes
-	rawbytes, err := hex.DecodeString(string(resBody))
-	if err != nil {
-		log.Print(err)
-		return nil
-	}
-
-	fmt.Println("http response: ", resBody)
-	fmt.Println("decoded http response: ", rawbytes)
-
-	return rawbytes
-}
-
-var shellKmsCmd string
-
-// Executes shell process "shellKmsCmd $pskId" and returns its stdout
-func pskShellLookup(pskId []byte) []byte {
-
-	cmd := exec.Command(shellKmsCmd, string(pskId))
-	stdout, err := cmd.Output()
-	if err != nil {
-		log.Print(err)
-		return nil
-	}
-
-	fmt.Println("stdout: ", string(stdout))
-
-	// FIXME: TODO: As a courtesy, strip terminating line (but only if the
-	// number of chars returned is odd?)
-	rawbytes, err := hex.DecodeString(string(stdout))
-	if err != nil {
-		log.Print(err)
-		return nil
-	}
-
-	return rawbytes
-}
-
-func mapFromCsv(path string) map[string][]byte {
-	f, err := os.Open(path)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer f.Close()
-
-	csvReader := csv.NewReader(f)
-	data, err := csvReader.ReadAll()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	var m map[string][]byte
-	m = make(map[string][]byte)
-
-	for _, e := range data {
-		psk, err := hex.DecodeString(e[1])
+func lookupKey(id string) ([]byte, error) {
+    if key, ok := pskMap[id]; ok {
+		log.Printf("key found for %s", id)
+        return key, nil
+    }
+    if *shellKMS != "" {
+		// require shellKMS to be a single executable path (no shell interpolation)
+		cmdPath, err := exec.LookPath(*shellKMS)
 		if err != nil {
-			log.Fatal(err)
+			return nil, fmt.Errorf("kms helper not found: %w", err)
 		}
 
-		m[e[0]] = psk
-	}
-
-	return m
-}
-
-func pskIdFromConn(conn net.Conn) string {
-	var dtlsConn *dtls.Conn = conn.(*dtls.Conn)
-	hint := string(dtlsConn.ConnectionState().IdentityHint)
-
-	return hint
+		cmd := exec.Command(cmdPath, id)
+		out, err := cmd.Output()
+        if err != nil {
+			log.Printf("shell exec error: %v", err)
+            return nil, err
+        }
+        key, err := hex.DecodeString(strings.TrimSpace(string(out)))
+        if err != nil {
+			log.Printf("hex decode error: %v", err)
+            return nil, err
+        }
+		log.Printf("key %v found for %s", key, id)
+        return key, nil
+    }
+    return nil, fmt.Errorf("unknown PSK id %s", id)
 }
 
 func main() {
-	bindPtr := flag.String("bind", "0.0.0.0:14881", "local ip:port to bind");
-	upsPtr := flag.String("connect", "kontor.eub.se:14999", "upstream plaintext ip:port")
-	csvPtr := flag.String("psk-csv", "", "id/psk csv file")
-	restPtr := flag.String("psk-rest", "", "id/psk rest looup uri")
-	restHdrsPtr := flag.String("rest-headers", "", "extra headers for REST kms")
-	idQueryKeyPtr := flag.String("id-query-key", "", "query key used for REST kms")
-	idQueryValPtr := flag.String("id-query-val-prefix", "", "query value prefix used for REST kms")
-	shellKmsPtr := flag.String("shell-kms-cmd", "", "Use shell cmd kms")
 
 	flag.Parse()
 
-	fmt.Println("bind:", *bindPtr);
-	fmt.Println("ups:", *upsPtr);
+	if *pskCSV != "" {
+		if err := loadPSKCSV(*pskCSV); err != nil {
+			log.Fatalf("failed to load PSK CSV: %v", err)
+		}
+	}
 
-	// Map between conns and PSK IDs, used to terminate stale connections
-	var connMap map[string]net.Conn
-	connMap = make(map[string]net.Conn)
-
-	upstreamAddr := *upsPtr;
-
-	addr, err := net.ResolveUDPAddr("udp", *bindPtr);
-	util.Check(err);
-
-	// Create parent context to cleanup handshaking connections on exit.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Prepare the configuration of the DTLS connection
 	config := &dtls.Config{
-		// Create timeout context for accepted connection.
-		ConnectContextMaker: func() (context.Context, func()) {
-			return context.WithTimeout(ctx, 30*time.Second)
+		PSK: func(identityHint []byte) ([]byte, error) {
+			id := string(identityHint)
+			return lookupKey(id)
 		},
-        ConnectionIDGenerator: dtls.RandomCIDGenerator(8),
-		CipherSuites: []dtls.CipherSuiteID{dtls.TLS_PSK_WITH_AES_128_CCM_8},
+		CipherSuites: []dtls.CipherSuiteID{
+			dtls.TLS_PSK_WITH_AES_128_CCM,
+			dtls.TLS_PSK_WITH_AES_128_CCM_8,
+			dtls.TLS_PSK_WITH_AES_256_CCM_8,
+			dtls.TLS_PSK_WITH_AES_128_GCM_SHA256,
+		},
+		ExtendedMasterSecret: func() dtls.ExtendedMasterSecretType {
+			if *requireEMS {
+				return dtls.RequireExtendedMasterSecret
+			}
+			return dtls.RequestExtendedMasterSecret
+		}(),
+		ConnectionIDGenerator: dtls.RandomCIDGenerator(8),
 	}
 
-	if len(*restHdrsPtr) > 0 {
+	upstreamAddr := *connectAddr
 
-		keyval := strings.Split(*restHdrsPtr, ":")
-		extraRestHeaders[keyval[0]] = keyval[1]
-
-		for k, v := range extraRestHeaders {
-			fmt.Println("extra headers: ", k, ": ", v)
-		}
-	}
-
-	if len(*idQueryKeyPtr) > 0 {
-		idQueryKey = *idQueryKeyPtr
-	} else {
-		idQueryKey = "pskId"
-	}
-
-	if len(*idQueryValPtr) > 0 {
-		idQueryVal = *idQueryValPtr
-	} else {
-		idQueryVal = ""
-	}
-
-	// If KMS lookup is via local csv, create a map from it
-	if len(*csvPtr) > 0 {
-		fmt.Println("csv:", *csvPtr);
-		kmsMap := mapFromCsv(*csvPtr);
-		config.PSK = func(hint []byte) ([]byte, error) {
-			return pskMapLookup(hint, kmsMap), nil
-		};
-
-	} else if len(*restPtr) > 0 {
-		fmt.Println("Targeting kms url:", *restPtr);
-
-		// Split into base and query param
-		var base string;
-		var xtra string;
-		split := strings.Split(*restPtr, "?")
-		if len(split) == 2 {
-			base = split[0];
-			xtra = split[1]
-			fmt.Println("url: ", base, " and ", xtra);
-		} else {
-			base = *restPtr;
-			xtra = "";
-		}
-
-		config.PSK = func(hint []byte) ([]byte, error) {
-			return pskRestLookup(hint, base, xtra), nil
-		};
-
-	} else if len(*shellKmsPtr) > 0 {
-		shellKmsCmd = *shellKmsPtr
-		config.PSK = func(hint []byte) ([]byte, error) {
-			return pskShellLookup(hint), nil
-		};
-
-	} else {
-		fmt.Println("No KMS lookup method provided!");
-		os.Exit(1)
-	}
-
+	// start dtls server
+	addr, err := net.ResolveUDPAddr("udp", *bindAddr)
 	listener, err := dtls.Listen("udp", addr, config)
-	util.Check(err)
+	if err != nil { panic(err) }
+
 	defer func() {
-		util.Check(listener.Close())
+		listener.Close()
 	}()
 
-	for {
-		// Wait for a connection.
-		fmt.Println("Listening")
+	fmt.Println("Listening")
 
+	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			log.Printf("accept error: %v", err)
 			continue
 		}
 
-		// DTLS sessions with ConnectionId can potentially last for days without
-		// any activity. For this reason we can't rely on the stack or the OS to
-		// garbage collect stale connections. The only indicator we have that a
-		// connection has gone stale is the client reconnecting with the same
-		// PskId. When this occurs, we close the old connection to prevent
-		// memory leaks.
-		// FIXME: Optimally, we would cull these after X time of inactivity, or
-		// simply Y time since handshake so that the session keys never get too
-		// old
-		pskId := pskIdFromConn(conn)
-		staleConn := connMap[pskId]
-		if staleConn != nil {
-			fmt.Println("Closing stale connection from ", pskId)
-			staleConn.Close()
-		}
-		connMap[pskIdFromConn(conn)] = conn
+		dtlsConn := conn.(*dtls.Conn)
 
-		other_conn, err := net.Dial("udp", upstreamAddr);
-		if err != nil {
-			log.Fatal("net.Dial failed:", err)
-			continue;
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := dtlsConn.HandshakeContext(ctx); err != nil {
+			cancel()
+			log.Printf("handshake failed: %v", err)
+			dtlsConn.Close()
+			continue
 		}
+		cancel()
 
-		go pipe(conn, other_conn);
+		if state, ok := dtlsConn.ConnectionState(); ok {
+			pskID := string(state.IdentityHint)
+			registerSession(pskID, dtlsConn)
+
+			go func(c *dtls.Conn, id string) {
+				defer unregisterSession(id, c)
+				upstream, err := net.Dial("udp", upstreamAddr)
+				if err != nil {
+					log.Printf("[%s] upstream dial error: %v", id, err)
+					c.Close()
+					return
+				}
+				pipe(c, upstream, pskID)
+			}(dtlsConn, pskID)
+
+		} else {
+			log.Printf("connection state not ready")
+			dtlsConn.Close()
+		}
 	}
+
+
 }
