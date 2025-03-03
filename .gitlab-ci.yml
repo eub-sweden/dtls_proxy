@@ -1,0 +1,19 @@
+variables:
+  STORAGE_DRIVER: vfs
+
+container-build:
+  image: quay.io/buildah/stable:latest
+  before_script:
+    - buildah version
+    - export HOME=$CI_BUILDS_DIR # needed sometimes to avoid conflict with host
+    - buildah login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - env  # tmp
+    - VERSION=$(git describe --always --abbrev=8 --dirty)
+    - echo buildah build -t $CI_PROJECT_NAME:$VERSION .
+    - buildah build -t $CI_PROJECT_NAME:$VERSION .
+    - echo buildah push $CI_PROJECT_NAME $CI_REGISTRY_IMAGE:$VERSION
+    - buildah push $CI_PROJECT_NAME $CI_REGISTRY_IMAGE:$VERSION
+
+  after_script:
+    - buildah logout $CI_REGISTRY
