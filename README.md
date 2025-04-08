@@ -40,11 +40,40 @@ architecture! The barrier of entry has never been lower! Yay!
 
 ## Key management integration
 
-Iteration 1 of the proxy only supports the simplest KMS integration possible:
-feeding the id/key pairs via a CSV file. Adding additional integrations (Redis,
-SQL, etc) is just a matter of extending the `pskLookup()` function (patches more
-than welcome).
+Iteration 1 of the proxy only supported the simplest KMS integration possible:
+feeding the id/key pairs via a CSV file.
 
+Experimental REST support is also available:
+
+```
+./dtls_proxy ... --psk-rest http://$KMS_SRV:$KMS_PORT/keys
+```
+
+The KMS service needs to expect a query parameter of the form
+`pskId=SOME_STRING`. If it requires additional query parameters (such as API
+key), you can piggyback that onto the URL like this:
+
+```
+--psk-rest http://$KMS_SRV:$KMS_PORT/keys?apiKey=7ad2d94771c9f11f26a51223cb0d0608
+```
+
+or whatever -- the final request will include both the `pskId=SOME_STRING` part
+and the `apiKey=7ad2d94771c9f11f26a51223cb0d0608` part. The PSK should be
+returned in the body as raw binary data (no content-type checking or anything
+like that is done by the DTLS proxy).
+
+### Best and simplest KMS integration method
+
+```
+./dtls_proxy ... --shell-kms-cmd /path/to/your/lookup/binary
+```
+
+Your lookup binary will be launched with the PSK ID as string arg and is
+expected to return the corresponding PSK key in plain ASCII hex.
+
+This binary can do whatever it wants, including random `curl` calls etc, so this
+method actually contains REST lookup as a subset. This is the recommended
+method.
 
 ## DTLS Connection ID
 
