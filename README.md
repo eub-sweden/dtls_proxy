@@ -97,6 +97,11 @@ A simple concept, but rather ground-breaking in its practical implications for
 cellular IoT, where data costs are measured in milli-cents and power consumption
 is measured in micro-amps.
 
+## Licensing
+Copyright 2023-2025 Elektronikutvecklingsbyrån EUB AB
+
+The dtls_proxy is released under the MIT license. For details about the license,
+see [LICENSE](LICENSE).
 
 ## Elektronikutvecklingsbyrån EUB AB
 

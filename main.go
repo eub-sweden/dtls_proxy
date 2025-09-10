@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2023 Elektronikutvecklingsbyrån EUB AB <https://www.eub.se/en>
+// SPDX-FileCopyrightText: 2023-2025 Elektronikutvecklingsbyrån EUB AB <https://www.eub.se/en>
 // SPDX-License-Identifier: MIT
 
 package main
