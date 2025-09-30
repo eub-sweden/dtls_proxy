@@ -41,39 +41,29 @@ architecture! The barrier of entry has never been lower! Yay!
 ## Key management integration
 
 Iteration 1 of the proxy only supported the simplest KMS integration possible:
-feeding the id/key pairs via a CSV file.
-
-Experimental REST support is also available:
-
-```
-./dtls_proxy ... --psk-rest http://$KMS_SRV:$KMS_PORT/keys
-```
-
-The KMS service needs to expect a query parameter of the form
-`pskId=SOME_STRING`. If it requires additional query parameters (such as API
-key), you can piggyback that onto the URL like this:
+feeding the id/key pairs via a CSV file. This is still supported but what I
+currently recommend is the "shell KMS" interface. If you use the argument
+`--shell-kms-cmd /path/to/my_command.sh`, the proxy will shell out to this
+command, with the PSK ID of the connected client as its first and only argument.
+It expects the shell command to return the PSK of the device in ASCII hex, i.e.
 
 ```
---psk-rest http://$KMS_SRV:$KMS_PORT/keys?apiKey=7ad2d94771c9f11f26a51223cb0d0608
+$ /path/to/my_command.sh clientId123
+275bc446abf921de084df7cdaf399082
 ```
 
-or whatever -- the final request will include both the `pskId=SOME_STRING` part
-and the `apiKey=7ad2d94771c9f11f26a51223cb0d0608` part. The PSK should be
-returned in the body as raw binary data (no content-type checking or anything
-like that is done by the DTLS proxy).
-
-### Best and simplest KMS integration method
+So, if you want KMS via REST, your command may look something like
 
 ```
-./dtls_proxy ... --shell-kms-cmd /path/to/your/lookup/binary
+#!/bin/sh
+
+BEARER_TOKEN="NWQwOTkyOTkwZGU0ZTFlMTZhODIwMzY4NGRiMDE4NTUyMWYyYTVhOTVhNGE2NDIwYTU1NDYxYzUyODEwZTY1Zgo="
+
+curl -s -X GET https://my-kms.com/pskKeys?pskId=$1 \
+    -H "Authorization: Bearer $BEARER_TOKEN" \
+    | jq -j '.[0] | .psk'
 ```
 
-Your lookup binary will be launched with the PSK ID as string arg and is
-expected to return the corresponding PSK key in plain ASCII hex.
-
-This binary can do whatever it wants, including random `curl` calls etc, so this
-method actually contains REST lookup as a subset. This is the recommended
-method.
 
 ## DTLS Connection ID
 
@@ -96,6 +86,47 @@ client during the handshake).
 A simple concept, but rather ground-breaking in its practical implications for
 cellular IoT, where data costs are measured in milli-cents and power consumption
 is measured in micro-amps.
+
+
+## Testing
+
+This repo includes a Go test file (`proxy_test.go`) that exercises the proxy
+end-to-end. To run these tests successfully you’ll need:
+
+1. **An echo server** running on UDP port **5684**.
+   A minimal Python version is provided below:
+
+```
+import socket
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind(("0.0.0.0", 5684))
+print("Listening on 0.0.0.0:5684")
+while True:
+    data, addr = sock.recvfrom(1500)
+    if not data:
+        continue
+    print(f"received {data!r} from {addr}")
+    sock.sendto(data, addr)
+```
+
+2. The proxy running locally on UDP port 5683, forwarding to the echo server:
+
+```
+./dtls_proxy --bind 0.0.0.0:5683 --connect 127.0.0.1:5684 --psk-csv keys.csv
+```
+
+3. A CSV file (keys.csv) with the contents:
+
+```
+Kalle,deadbeefdeadbeef
+```
+
+Once the echo server and proxy are running, you can run the tests with
+
+```
+go test -v
+```
 
 
 ## Elektronikutvecklingsbyrån EUB AB
