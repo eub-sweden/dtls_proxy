@@ -229,36 +229,37 @@ func main() {
 			continue
 		}
 
-		dtlsConn := conn.(*dtls.Conn)
+		go func(conn net.Conn) {
 
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		if err := dtlsConn.HandshakeContext(ctx); err != nil {
+			dtlsConn := conn.(*dtls.Conn)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := dtlsConn.HandshakeContext(ctx); err != nil {
+				cancel()
+				log.Printf("handshake failed: %v", err)
+				dtlsConn.Close()
+				return
+			}
 			cancel()
-			log.Printf("handshake failed: %v", err)
-			dtlsConn.Close()
-			continue
-		}
-		cancel()
 
-		if state, ok := dtlsConn.ConnectionState(); ok {
-			pskID := string(state.IdentityHint)
-			registerSession(pskID, dtlsConn)
+			if state, ok := dtlsConn.ConnectionState(); ok {
+				pskID := string(state.IdentityHint)
+				registerSession(pskID, dtlsConn)
 
-			go func(c *dtls.Conn, id string) {
-				defer unregisterSession(id, c)
+				defer unregisterSession(pskID, dtlsConn)
 				upstream, err := net.Dial("udp", upstreamAddr)
 				if err != nil {
-					log.Printf("[%s] upstream dial error: %v", id, err)
-					c.Close()
+					log.Printf("[%s] upstream dial error: %v", pskID, err)
+					dtlsConn.Close()
 					return
 				}
-				pipe(c, upstream, pskID)
-			}(dtlsConn, pskID)
+				pipe(dtlsConn, upstream, pskID)
 
-		} else {
-			log.Printf("connection state not ready")
-			dtlsConn.Close()
-		}
+			} else {
+				log.Printf("connection state not ready")
+				dtlsConn.Close()
+			}
+		}(conn)
 	}
 
 
